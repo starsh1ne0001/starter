@@ -34,7 +34,7 @@ jobs:
     name: Windows binary
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: What the runner brings along
         run: |
@@ -45,7 +45,7 @@ jobs:
       # dependency tree again. The cache is keyed on Cargo.lock, so it is
       # discarded automatically when a dependency changes.
       - name: Keep the dependency cache
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
