@@ -1,0 +1,29 @@
+# Build output. Everything cargo writes is derived from the sources, is large,
+# and is different on every machine, so none of it belongs in a repository.
+/target
+
+# The launcher's own configuration is personal: it holds the absolute paths to
+# your programs and the keys you reserved. The launcher writes an example file
+# by itself when it starts without one, so nothing is lost by keeping it out —
+# and `git add -f launcher.toml` puts it in anyway if you want to ship yours.
+launcher.toml
+
+# Bookkeeping of the editor or agent host that works in this folder. It names
+# this checkout locally and means nothing to anybody else.
+.freebuff/
+
+# Editors and the operating system leave these behind.
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# `rustfmt` and `rustc` backups.
+*.rs.bk
+
+# Cargo.lock is deliberately *not* ignored: this is an application, not a
+# library, so the exact versions that were tested are part of the project.
