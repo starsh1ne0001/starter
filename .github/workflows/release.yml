@@ -1,0 +1,107 @@
+# Builds the Windows binary and publishes it as a release.
+#
+# Two shapes, one job:
+#
+#   * every push to `main` refreshes a single rolling release called
+#     "Development build" (tag `dev`). The binary sitting there is always the
+#     newest state of main that passed its tests — no version number to look up,
+#     one permanent download link.
+#   * pushing a tag like `v0.1.0` builds that very same binary from the tag and
+#     gives it a release of its own, with the notes GitHub writes from the
+#     commits in between. That is the release to point people at.
+#
+# Nothing is published before the tests and the lint have passed, so a broken
+# state cannot end up online even by accident.
+
+name: Release
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+
+# One run per branch or tag at a time. Two pushes in quick succession would
+# otherwise race for the same release.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write # creating, deleting and filling releases
+
+jobs:
+  windows:
+    name: Windows binary
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: What the runner brings along
+        run: |
+          rustc --version
+          cargo --version
+
+      # Without this, every push would download and compile the whole
+      # dependency tree again. The cache is keyed on Cargo.lock, so it is
+      # discarded automatically when a dependency changes.
+      - name: Keep the dependency cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      # The same two commands that are run by hand before a commit, in the same
+      # order: what would not pass locally does not get published either.
+      # --locked keeps the versions from Cargo.lock.
+      - name: Test
+        run: cargo test --locked
+
+      - name: Lint
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+      - name: Build
+        run: cargo build --release --locked
+
+      # The rolling release is deleted and rebuilt rather than edited, because
+      # that is the only way its `dev` tag ends up on the commit the binary was
+      # built from. The release URL stays the same either way.
+      - name: Refresh the development release
+        if: github.ref == 'refs/heads/main'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view dev >/dev/null 2>&1; then
+            gh release delete dev --yes --cleanup-tag
+          fi
+          gh release create dev \
+              --target "$GITHUB_SHA" \
+              --title "Development build" \
+              --prerelease \
+              --notes 'Rolling build of the newest main. The binary is replaced on every push, so its version does not change - the tag follows main instead.'
+          gh release upload dev target/release/starter.exe --clobber
+
+      # A tag release stays put: the tag was pushed deliberately, so the release
+      # is centred on it and GitHub writes the notes. --verify-tag makes the run
+      # fail rather than invent a tag if it is missing.
+      - name: Publish the tagged release
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          if ! gh release view "$tag" >/dev/null 2>&1; then
+            gh release create "$tag" \
+                --verify-tag \
+                --title "$tag" \
+                --generate-notes
+          fi
+          # --clobber so that re-running a failed run replaces the asset instead
+          # of stopping at "already exists".
+          gh release upload "$tag" target/release/starter.exe --clobber

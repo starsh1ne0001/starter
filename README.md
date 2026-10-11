@@ -46,6 +46,26 @@ first time. To use a different file:
 cargo run --release -- path/to/launcher.toml
 ```
 
+## Downloads
+
+Running it does not need a Rust toolchain: the
+[releases](https://github.com/starsh1ne0001/starter/releases) page carries a
+ready-made `starter.exe` for Windows.
+
+* The [development build](https://github.com/starsh1ne0001/starter/releases/tag/dev)
+  is rebuilt on every push to `main` and always holds the newest state that
+  passed its tests. Its version number does not move — the tag follows `main`
+  instead — so one link keeps working.
+* A tag gives that commit a release of its own: `git tag v0.1.0 && git push origin v0.1.0`
+  builds the same binary from the tag, with the notes GitHub writes from the
+  commits since the release before it. Use these whenever the file leaves your
+  own machine.
+
+Both come out of
+[.github/workflows/release.yml](.github/workflows/release.yml), and neither is
+published before `cargo test` and `cargo clippy --all-targets -- -D warnings`
+have passed.
+
 ## Config format
 
 Plain TOML, readable and editable by hand. The GUI writes the same format.
