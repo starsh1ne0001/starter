@@ -11,3 +11,12 @@ rfd = "0.17.2"
 serde = { version = "1.0.229", features = ["derive"] }
 sysinfo = "0.39.6"
 toml = "1.1.8"
+
+# The icon in the notification area, where there is one. Only pulled in on
+# Windows: on Linux the crate wants a GTK main loop of its own, which is a
+# different program's worth of arranging.
+[target.'cfg(windows)'.dependencies]
+tray-icon = "0.26.1"
+# The console window Windows opens for a program it started itself, which has to
+# be given back once the launcher outlives its window. See src/console.rs.
+windows-sys = { version = "0.61", features = ["Win32_System_Console"] }

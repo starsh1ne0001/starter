@@ -24,6 +24,7 @@ use crate::config::{Config, Group, Program};
 use crate::hotkey::{Chord, Registry};
 use crate::processes::{self, ProcessManager, Target};
 use crate::theme;
+use crate::tray::{Tray, TrayEvent};
 
 /// How often the process list is re-read while the window has focus. The status
 /// has to be honest to the second there.
@@ -62,6 +63,8 @@ enum Action {
     SetHotkey(usize, Chord),
     ClearHotkey(usize),
     CancelRecording,
+    /// Turn tray mode on or off.
+    SetTray(bool),
 }
 
 /// What toggling a group means, given how much of it is running.
@@ -250,6 +253,9 @@ pub struct LauncherApp {
     config_path: PathBuf,
     manager: ProcessManager,
     hotkeys: Registry,
+    /// The icon in the notification area, for as long as tray mode is on. What
+    /// it is asked for arrives here, and what it shows is kept in step here.
+    tray: Tray,
     /// Running instances per identification rule.
     running: HashMap<Target, usize>,
     /// The rule that identifies each configured program, in the same order as
@@ -266,6 +272,12 @@ pub struct LauncherApp {
     selected_group: usize,
     dirty: bool,
     message: String,
+    /// Set when the icon's menu asked to quit.
+    ///
+    /// One close has to be told from the others: in tray mode the close button
+    /// only hides the window, and that is the last thing a program that was
+    /// asked to quit should do.
+    quitting: bool,
 
     /// Group whose hotkey is currently being recorded, if any.
     recording: Option<usize>,
@@ -279,9 +291,10 @@ pub struct LauncherApp {
 }
 
 impl LauncherApp {
-    /// `hotkeys` decides whether combinations are reserved system-wide: the
-    /// program passes a live registry, tests a detached one.
-    pub fn new(config_path: PathBuf, hotkeys: Registry) -> Self {
+    /// `hotkeys` and `tray` decide what reaches outside the window: the program
+    /// passes a live registry and a live tray, tests pass detached ones that
+    /// reserve nothing and put nothing up.
+    pub fn new(config_path: PathBuf, hotkeys: Registry, tray: Tray) -> Self {
         let (config, message) = match Config::load(&config_path) {
             Ok(config) => (config, String::new()),
             Err(err) => (Config::default(), err),
@@ -302,6 +315,8 @@ impl LauncherApp {
             dirty: false,
             message,
             hotkeys,
+            tray,
+            quitting: false,
             recording: None,
             recording_note: String::new(),
             manager,
@@ -823,6 +838,20 @@ impl LauncherApp {
                         self.sync_hotkeys();
                     }
                 }
+
+                Action::SetTray(on) => {
+                    self.config.tray = on;
+                    self.dirty = true;
+                    self.message = if on {
+                        "Tray mode on: closing the window hides it instead of quitting."
+                    } else {
+                        "Tray mode off: closing the window quits the launcher."
+                    }
+                    .to_string();
+                    // Whether the icon really appears is decided where it is put
+                    // up, on the next frame — and if it cannot appear, that is
+                    // said instead of this.
+                }
             }
         }
     }
@@ -836,6 +865,63 @@ impl LauncherApp {
             .into_iter()
             .map(Action::ToggleGroup)
             .collect()
+    }
+
+    /// Everything the icon asked for, turned into actions, plus the work of
+    /// keeping the icon in step with the config.
+    ///
+    /// Like [`LauncherApp::hotkey_actions`], this is kept out of the drawing
+    /// code: nothing here needs a window, and none of it needs a notification
+    /// area to exist.
+    fn tray_actions(&mut self, ctx: &egui::Context) -> Vec<Action> {
+        // Called every frame, and free when nothing changed: the menu is only
+        // rebuilt when it would read differently. This is what makes a renamed
+        // group appear in the menu without every path that can rename it having
+        // to remember the icon.
+        let notes = self.tray.sync(ctx, self.config.tray, &self.config.groups);
+        if !notes.is_empty() {
+            self.message = notes.join(" ");
+        }
+
+        let mut actions = Vec::new();
+        for event in self.tray.events() {
+            match event {
+                TrayEvent::Show => {
+                    // Back and in front: whoever clicked the icon wants to see
+                    // the window, not merely own it.
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                }
+                TrayEvent::ToggleGroup(group) => actions.push(Action::ToggleGroup(group)),
+                TrayEvent::Quit => {
+                    self.quitting = true;
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+            }
+        }
+        actions
+    }
+
+    /// The window's close button.
+    ///
+    /// With the icon in the notification area, closing only takes the window off
+    /// the screen: the launcher keeps running, the hotkeys keep working, and the
+    /// icon is the way back. Two closings are let through untouched — the one
+    /// the icon's menu asked for, which is what "Quit" means, and the one where
+    /// there is no icon at all, because hiding a window with no way back to it
+    /// would be a trap.
+    fn handle_close(&mut self, ctx: &egui::Context) {
+        if self.quitting || !self.tray.is_showing() {
+            return;
+        }
+        if !ctx.input(|input| input.viewport().close_requested()) {
+            return;
+        }
+
+        ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+        self.message =
+            "Hidden; still running — the notification area brings it back.".to_string();
     }
 
     /// Combinations that the system did not take still work while the window
@@ -1048,6 +1134,83 @@ fn keycap(ui: &mut egui::Ui, text: &str, hint: &str) -> egui::Response {
     painter.galley(rect.center() - galley.size() / 2.0, galley, color);
 
     response.on_hover_text(hint)
+}
+
+/// The tray annunciator: a lamp, one word, one thing to click.
+///
+/// The word is what the switch does; the lamp is what it does it *to*, and it is
+/// the same lamp the entries use, because colour has exactly one job here. Lit
+/// green means there really is an icon in the notification area; amber means
+/// tray mode is on but there is nothing there to bring the window back; a hollow
+/// ring means the mode is off. Behind the word sits a wash of that same state
+/// colour, so an active tray mode reads from across the window without green
+/// having to mean a second thing.
+fn tray_switch(ui: &mut egui::Ui, mode: bool, icon_up: bool) -> egui::Response {
+    let state = if icon_up {
+        Some(theme::LIVE)
+    } else if mode {
+        Some(theme::ALERT)
+    } else {
+        None
+    };
+    let color = state.unwrap_or(theme::TEXT);
+
+    let galley = ui
+        .painter()
+        .layout_no_wrap("Tray".to_owned(), theme::semibold(theme::BODY), color);
+
+    let padding = Vec2::new(7.0, 3.0);
+    let lamp = 16.0;
+    let gap = 3.0;
+    let size = Vec2::new(
+        padding.x * 2.0 + lamp + gap + galley.size().x,
+        (galley.size().y + padding.y * 2.0).max(ui.spacing().interact_size.y),
+    );
+    let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
+    let painter = ui.painter();
+
+    if let Some(color) = state {
+        // Hovering lifts the wash, the way every other control here answers the
+        // pointer. The colour is mixed with the surface rather than used neat,
+        // so the lamp stays the one thing that *is* the state.
+        let strength = if response.hovered() { 0.26 } else { 0.16 };
+        painter.rect_filled(
+            rect,
+            CornerRadius::same(theme::RADIUS),
+            theme::mix(theme::SURFACE, color, strength),
+        );
+    } else if response.hovered() {
+        painter.rect_filled(rect, CornerRadius::same(theme::RADIUS), theme::RAISED);
+    }
+
+    let center = egui::pos2(rect.left() + padding.x + lamp / 2.0, rect.center().y);
+    match state {
+        Some(color) => {
+            let glow = ui
+                .ctx()
+                .animate_bool_with_time(egui::Id::new("tray-lamp"), true, 0.22);
+            painter.circle_filled(center, 3.0, color);
+            painter.circle_stroke(
+                center,
+                6.0,
+                Stroke::new(1.0, theme::mix(theme::SURFACE, color, 0.5 * glow)),
+            );
+        }
+        None => {
+            painter.circle_stroke(center, 3.0, Stroke::new(1.2, theme::IDLE));
+        }
+    }
+
+    painter.galley(
+        egui::pos2(
+            rect.left() + padding.x + lamp + gap,
+            rect.center().y - galley.size().y / 2.0,
+        ),
+        galley,
+        color,
+    );
+
+    response
 }
 
 /// Opens the operating system's file picker for choosing an executable.
@@ -1387,29 +1550,69 @@ fn recording_modal(
 }
 
 impl eframe::App for LauncherApp {
+    /// Runs before every [`LauncherApp::paint`] — and, while the window is off
+    /// the screen, instead of it: eframe runs no ui pass at all for a window
+    /// that is hidden, and calls this half on its own so that the program behind
+    /// it stays alive. That is what keeps a hotkey working and a delay coming
+    /// due in tray mode.
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        let actions = self.head(ctx);
+        self.apply(actions);
+    }
+
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        self.draw(ui);
+        let actions = self.paint(ui);
+        self.apply(actions);
     }
 }
 
 impl LauncherApp {
-    /// Builds one frame. Kept separate from [`eframe::App`] so it can be
-    /// exercised headlessly in tests.
+    /// One whole frame: the head and then the window.
+    ///
+    /// This is what the tests drive. eframe itself does the two halves
+    /// separately, because it keeps running the head while the window is hidden
+    /// — see [`eframe::App`] above.
+    #[cfg(test)]
     fn draw(&mut self, ui: &mut egui::Ui) {
-        let focused = ui.ctx().input(|input| input.focused);
+        let mut actions = self.head(ui.ctx());
+        actions.extend(self.paint(ui));
+        self.apply(actions);
+    }
+
+    /// Everything of a frame that is not drawing: the process list, the steps
+    /// still waiting for their delay, the hotkeys, the icon and the close
+    /// button. Returns what the user asked for through any of them.
+    ///
+    /// Kept apart from [`LauncherApp::paint`] because of what eframe does with a
+    /// hidden window: no ui pass, this half only. Anything that has to keep
+    /// working with the window off the screen belongs here.
+    fn head(&mut self, ctx: &egui::Context) -> Vec<Action> {
+        let focused = ctx.input(|input| input.focused);
         let interval = refresh_interval(focused);
         if self.last_refresh.elapsed() >= interval {
             self.refresh_now();
         }
-        // A delay has to come due even while the window is in the background,
-        // so the next frame is scheduled for the earliest one — never later than
-        // the regular refresh.
+        // A delay has to come due even while the window is hidden, so the next
+        // frame is scheduled for the earliest one — never later than the regular
+        // refresh.
         self.run_due_pending();
-        ui.ctx()
-            .request_repaint_after(next_frame_delay(interval, &self.pending, Instant::now()));
+        ctx.request_repaint_after(next_frame_delay(interval, &self.pending, Instant::now()));
+
+        self.handle_close(ctx);
 
         let mut actions = self.hotkey_actions();
-        actions.extend(self.in_window_actions(ui));
+        actions.extend(self.tray_actions(ctx));
+        actions
+    }
+
+    /// Builds the window. Kept separate from [`eframe::App`] so it can be
+    /// exercised headlessly in tests.
+    fn paint(&mut self, ui: &mut egui::Ui) -> Vec<Action> {
+        // Only here, never in the head: this reads the keys that were typed into
+        // the window, and a frame that runs with the window hidden has no keys
+        // of its own — it would be looking at the ones from the last visible
+        // frame and re-fire them.
+        let mut actions = self.in_window_actions(ui);
 
         self.top_bar(ui, &mut actions);
         self.status_bar(ui);
@@ -1446,11 +1649,16 @@ impl LauncherApp {
             }
         }
 
-        self.apply(actions);
+        actions
     }
 
     fn top_bar(&mut self, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
+        // Read before the fields are borrowed apart below: whether there is
+        // really an icon up is what the Tray annunciator answers with — and it is
+        // the same question the close button asks.
+        let icon_up = self.tray.is_showing();
         let Self {
+            config,
             config_path,
             dirty,
             ..
@@ -1474,6 +1682,27 @@ impl LauncherApp {
                             actions.push(action);
                         }
                     }
+                    // Tray mode: whether closing the window ends the program or
+                    // only takes it off the screen. An annunciator rather than a
+                    // plain switch, because it changes what the close button
+                    // does and has to be readable at a glance.
+                    let tray = config.tray;
+                    let hint = match (tray, icon_up) {
+                        (true, true) => "Closing the window only hides it; the icon in the notification area brings it back",
+                        (true, false) => "Tray mode is on, but this build has no notification-area icon: closing the window still quits",
+                        (false, _) => "Keep running in the notification area when the window is closed",
+                    };
+                    if tray_switch(ui, tray, icon_up)
+                        .on_hover_text(hint)
+                        .clicked()
+                    {
+                        actions.push(Action::SetTray(!tray));
+                        // The icon is put up by the next frame — the head does
+                        // that — so the next frame is asked for now instead of
+                        // at the next scheduled refresh.
+                        ui.ctx().request_repaint();
+                    }
+
                     if *dirty {
                         ui.label(caption("unsaved"));
                         dot(ui, theme::ALERT);
@@ -2027,7 +2256,7 @@ mod tests {
     #[test]
     fn draws_a_full_frame() {
         let (dir, path) = temp_config("full-frame");
-        let mut app = LauncherApp::new(path, Registry::detached());
+        let mut app = LauncherApp::new(path, Registry::detached(), Tray::detached());
         let ctx = themed_context();
 
         for _ in 0..3 {
@@ -2097,9 +2326,10 @@ mod tests {
                     }],
                     ..Group::default()
                 }],
+                ..Config::default()
             },
         );
-        let mut app = LauncherApp::new(path, Registry::detached());
+        let mut app = LauncherApp::new(path, Registry::detached(), Tray::detached());
         let ctx = themed_context();
 
         let stopped = painted_with(&run_frames(&ctx, &mut app, 3), theme::LIVE);
@@ -2143,9 +2373,10 @@ mod tests {
                         stop_delay: 12.5,
                     }],
                 }],
+                ..Config::default()
             },
         );
-        let mut app = LauncherApp::new(path, Registry::detached());
+        let mut app = LauncherApp::new(path, Registry::detached(), Tray::detached());
 
         for size in [
             Vec2::new(880.0, 600.0), // default window
@@ -2269,6 +2500,7 @@ mod tests {
                         ..Program::default()
                     }],
                 }],
+                ..Config::default()
             },
         );
         (dir, path)
@@ -2280,7 +2512,7 @@ mod tests {
     fn a_start_delay_holds_a_program_back() {
         let _guard = processes::process_test_lock();
         let (dir, path) = config_with_delays("start-delay", 0.8, 0.0);
-        let mut app = LauncherApp::new(path, Registry::detached());
+        let mut app = LauncherApp::new(path, Registry::detached(), Tray::detached());
         let ctx = themed_context();
 
         app.apply(vec![Action::ToggleGroup(0)]);
@@ -2375,9 +2607,10 @@ mod tests {
                     hotkey: String::new(),
                     programs,
                 }],
+                ..Config::default()
             },
         );
-        let mut app = LauncherApp::new(path, Registry::detached());
+        let mut app = LauncherApp::new(path, Registry::detached(), Tray::detached());
         let ctx = themed_context();
 
         let commanded = Instant::now();
@@ -2454,9 +2687,10 @@ mod tests {
                         },
                     ],
                 }],
+                ..Config::default()
             },
         );
-        let mut app = LauncherApp::new(path, Registry::detached());
+        let mut app = LauncherApp::new(path, Registry::detached(), Tray::detached());
         let ctx = themed_context();
 
         app.apply(vec![Action::ToggleGroup(0)]);
@@ -2495,7 +2729,7 @@ mod tests {
     fn a_stop_delay_lets_a_program_run_on() {
         let _guard = processes::process_test_lock();
         let (dir, path) = config_with_delays("stop-delay", 0.0, 0.8);
-        let mut app = LauncherApp::new(path, Registry::detached());
+        let mut app = LauncherApp::new(path, Registry::detached(), Tray::detached());
         let ctx = themed_context();
 
         app.apply(vec![Action::ToggleGroup(0)]);
@@ -2534,7 +2768,7 @@ mod tests {
     fn stopping_calls_a_pending_start_off() {
         let _guard = processes::process_test_lock();
         let (dir, path) = config_with_delays("call-off", 0.7, 0.0);
-        let mut app = LauncherApp::new(path, Registry::detached());
+        let mut app = LauncherApp::new(path, Registry::detached(), Tray::detached());
         let ctx = themed_context();
 
         app.apply(vec![Action::ToggleGroup(0)]);
@@ -2606,9 +2840,10 @@ mod tests {
                         ..Program::default()
                     }],
                 }],
+                ..Config::default()
             },
         );
-        let mut app = LauncherApp::new(path, Registry::detached());
+        let mut app = LauncherApp::new(path, Registry::detached(), Tray::detached());
         let ctx = themed_context();
 
         run_frames(&ctx, &mut app, 1);
@@ -2667,9 +2902,10 @@ mod tests {
                         },
                     ],
                 }],
+                ..Config::default()
             },
         );
-        let mut app = LauncherApp::new(path, Registry::detached());
+        let mut app = LauncherApp::new(path, Registry::detached(), Tray::detached());
 
         // Every entry got its own rule, in the order of the config.
         assert_eq!(app.targets.len(), 1, "one group");
@@ -2742,10 +2978,11 @@ mod tests {
                         },
                     ],
                 }],
+                ..Config::default()
             },
         );
 
-        let mut app = LauncherApp::new(path, Registry::detached());
+        let mut app = LauncherApp::new(path, Registry::detached(), Tray::detached());
         let chord = Chord::parse("Ctrl+Alt+9").expect("the test chord should parse");
 
         // Nothing is running, so the hotkey starts the group.
@@ -2830,7 +3067,10 @@ mod tests {
     /// launcher finds and what it can toggle.
     fn one_group_config(tag: &str, group: Group) -> (PathBuf, PathBuf) {
         let (dir, path) = temp_config(tag);
-        write_config(&path, &Config { groups: vec![group] });
+        write_config(&path, &Config {
+            groups: vec![group],
+            ..Config::default()
+        });
         (dir, path)
     }
 
@@ -2846,7 +3086,7 @@ mod tests {
                 ..Group::default()
             },
         );
-        let mut app = LauncherApp::new(path, Registry::detached());
+        let mut app = LauncherApp::new(path, Registry::detached(), Tray::detached());
         let ctx = themed_context();
 
         // What a click on the key cap produces.
@@ -2880,7 +3120,7 @@ mod tests {
                 ..Group::default()
             },
         );
-        let mut app = LauncherApp::new(path, Registry::detached());
+        let mut app = LauncherApp::new(path, Registry::detached(), Tray::detached());
         let ctx = themed_context();
         app.apply(vec![Action::Record(0)]);
 
@@ -2920,7 +3160,7 @@ mod tests {
                 }],
             },
         );
-        let mut app = LauncherApp::new(path, Registry::detached());
+        let mut app = LauncherApp::new(path, Registry::detached(), Tray::detached());
         let ctx = themed_context();
         assert!(!app.hotkeys.is_global(0), "a detached registry reserves nothing");
 
@@ -2939,7 +3179,7 @@ mod tests {
     #[test]
     fn a_hotkey_is_set_and_cleared_through_the_config() {
         let (dir, path) = temp_config("hotkey-edit");
-        let mut app = LauncherApp::new(path.clone(), Registry::detached());
+        let mut app = LauncherApp::new(path.clone(), Registry::detached(), Tray::detached());
         let chord = Chord::parse("ctrl+alt+w").expect("the chord should parse");
 
         app.apply(vec![Action::SetHotkey(0, chord)]);
@@ -2973,5 +3213,274 @@ mod tests {
         assert_eq!(refresh_interval(true), REFRESH_FOCUSED);
         assert_eq!(refresh_interval(false), REFRESH_BACKGROUND);
         assert!(REFRESH_BACKGROUND > REFRESH_FOCUSED);
+    }
+
+    // -----------------------------------------------------------------------
+    // Tray mode
+    // -----------------------------------------------------------------------
+
+    /// Draws one frame and returns the viewport commands it asked for — how a
+    /// test sees "hide the window", "put it back" or "quit". `closing` says
+    /// whether the close button was what this frame is about.
+    fn frame_commands(
+        app: &mut LauncherApp,
+        ctx: &egui::Context,
+        closing: bool,
+    ) -> Vec<egui::ViewportCommand> {
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(880.0, 600.0))),
+            viewports: [(
+                egui::ViewportId::ROOT,
+                egui::ViewportInfo {
+                    events: if closing {
+                        vec![egui::ViewportEvent::Close]
+                    } else {
+                        Vec::new()
+                    },
+                    ..Default::default()
+                },
+            )]
+            .into_iter()
+            .collect(),
+            ..Default::default()
+        };
+        let output = ctx.run_ui(input, |ui| app.draw(ui));
+        let commands = output.viewport_output[&egui::ViewportId::ROOT]
+            .commands
+            .clone();
+        output.drop_without_applying_deltas();
+        commands
+    }
+
+    /// One group with a hotkey and a single program that cannot possibly start.
+    /// Toggling it is visible in the note the launcher writes, which is how a
+    /// test without a screen can tell that a key press or a menu line reached
+    /// its group.
+    fn impossible_group(tag: &str) -> (PathBuf, PathBuf) {
+        one_group_config(
+            tag,
+            Group {
+                name: "Keys".to_string(),
+                hotkey: "Ctrl+Alt+W".to_string(),
+                programs: vec![Program {
+                    name: "Nope".to_string(),
+                    program: "starter-test-never-runs.exe".to_string(),
+                    ..Program::default()
+                }],
+            },
+        )
+    }
+
+    /// With the icon up, the close button only takes the window off the screen:
+    /// the frame calls the close off and asks for the window to disappear.
+    #[test]
+    fn closing_the_window_only_hides_it_in_tray_mode() {
+        let (dir, path) = impossible_group("close-to-tray");
+        let mut app = LauncherApp::new(path, Registry::detached(), Tray::pretending());
+        app.config.tray = true;
+        let ctx = themed_context();
+
+        let commands = frame_commands(&mut app, &ctx, true);
+
+        assert!(
+            commands.contains(&egui::ViewportCommand::CancelClose),
+            "the window closed although the icon was up: {commands:?}"
+        );
+        assert!(
+            commands.contains(&egui::ViewportCommand::Visible(false)),
+            "the window was not taken off the screen: {commands:?}"
+        );
+        assert!(
+            app.message.contains("Hidden"),
+            "the user was not told where the window went: {}",
+            app.message
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Without an icon there is nothing to come back through, so the close goes
+    /// through as it always did. That is also what every platform whose
+    /// notification area is not wired up gets.
+    #[test]
+    fn without_an_icon_the_window_closes_as_usual() {
+        let (dir, path) = impossible_group("close-without-icon");
+        let mut app = LauncherApp::new(path, Registry::detached(), Tray::detached());
+        app.config.tray = true;
+        let ctx = themed_context();
+
+        let commands = frame_commands(&mut app, &ctx, true);
+
+        assert!(
+            !commands.contains(&egui::ViewportCommand::CancelClose),
+            "the window was kept alive although there is no way back to it: {commands:?}"
+        );
+        assert!(
+            !commands.contains(&egui::ViewportCommand::Visible(false)),
+            "the window was hidden with no way back to it: {commands:?}"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The half of a frame that is not drawing is what keeps running while the
+    /// window is hidden — eframe calls exactly that half then. This is the path
+    /// a hotkey takes when there is nothing on screen to press it in.
+    #[test]
+    fn a_hotkey_still_reaches_its_group_with_the_window_hidden() {
+        let (dir, path) = impossible_group("hidden-hotkey");
+        let mut app = LauncherApp::new(path, Registry::detached(), Tray::pretending());
+        app.config.tray = true;
+        let ctx = themed_context();
+        let chord = Chord::parse("ctrl+alt+w").expect("the chord should parse");
+
+        app.hotkeys.trigger(chord);
+        // No ui pass at all: the window is off the screen.
+        let actions = app.head(&ctx);
+        app.apply(actions);
+
+        assert!(
+            app.message.contains("Could not start"),
+            "the hotkey did not reach its group with the window hidden: {}",
+            app.message
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The icon is the way back, and the way to a group without opening
+    /// anything: a click asks for the window, a line in the menu toggles its
+    /// group.
+    #[test]
+    fn the_icon_brings_the_window_back_and_toggles_groups() {
+        let (dir, path) = impossible_group("tray-actions");
+        let mut app = LauncherApp::new(path, Registry::detached(), Tray::pretending());
+        app.config.tray = true;
+        let ctx = themed_context();
+
+        app.tray.trigger(TrayEvent::Show);
+        let commands = frame_commands(&mut app, &ctx, false);
+        assert!(
+            commands.contains(&egui::ViewportCommand::Visible(true)),
+            "a click on the icon did not ask for the window back: {commands:?}"
+        );
+        assert!(
+            commands.contains(&egui::ViewportCommand::Focus),
+            "the window came back but not to the front: {commands:?}"
+        );
+
+        app.tray.trigger(TrayEvent::ToggleGroup(0));
+        frame_commands(&mut app, &ctx, false);
+        assert!(
+            app.message.contains("Could not start"),
+            "the menu line did not reach its group: {}",
+            app.message
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Quit means quit: the close that follows is not answered the way the close
+    /// button is, or a program in tray mode could never be ended from the icon.
+    #[test]
+    fn quitting_from_the_icon_is_not_answered_by_hiding_the_window() {
+        let (dir, path) = impossible_group("tray-quit");
+        let mut app = LauncherApp::new(path, Registry::detached(), Tray::pretending());
+        app.config.tray = true;
+        let ctx = themed_context();
+
+        app.tray.trigger(TrayEvent::Quit);
+        let commands = frame_commands(&mut app, &ctx, false);
+        assert!(
+            commands.contains(&egui::ViewportCommand::Close),
+            "the icon's Quit did not ask to close anything: {commands:?}"
+        );
+
+        let commands = frame_commands(&mut app, &ctx, true);
+        assert!(
+            !commands.contains(&egui::ViewportCommand::CancelClose),
+            "a quit was answered by hiding the window instead of ending the program"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The switch in the header is a plain config value: written, saved, read
+    /// back, and left out of the file while it is off.
+    #[test]
+    fn tray_mode_is_switched_through_the_config() {
+        let (dir, path) = temp_config("tray-switch");
+        let mut app = LauncherApp::new(path.clone(), Registry::detached(), Tray::detached());
+
+        app.apply(vec![Action::SetTray(true)]);
+        assert!(app.config.tray, "the switch did not take");
+        assert!(app.dirty, "changing the switch has to be saved");
+        assert!(app.message.contains("Tray mode on"), "{}", app.message);
+
+        app.apply(vec![Action::Save]);
+        app.apply(vec![Action::Reload]);
+        assert!(
+            app.config.tray,
+            "the switch did not survive a save and a reload"
+        );
+
+        app.apply(vec![Action::SetTray(false)]);
+        assert!(!app.config.tray);
+        assert!(app.message.contains("Tray mode off"), "{}", app.message);
+        app.apply(vec![Action::Save]);
+
+        let text = std::fs::read_to_string(&path).expect("the config should exist");
+        assert!(
+            !text.contains("tray"),
+            "a switched-off mode was left in the file:\n{text}"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Tray mode has to be visible in the window's own language, and that
+    /// language is colour. The header lights up while the launcher really has an
+    /// icon in the notification area — and it does not claim that while there is
+    /// nowhere to put one, which is the difference between "this survives its
+    /// window" and "this was asked for and did not happen".
+    #[test]
+    fn tray_mode_shows_itself_in_colour() {
+        let (dir, path) = impossible_group("tray-colour");
+        let ctx = themed_context();
+
+        // Off: the annunciator is there, quietly, and nothing in the header is
+        // lit. This is also the state every other drawing test is in.
+        let mut app = LauncherApp::new(path.clone(), Registry::detached(), Tray::detached());
+        assert_eq!(
+            painted_with(&run_frames(&ctx, &mut app, 3), theme::LIVE),
+            Painted::default(),
+            "tray mode is off, so nothing may be green"
+        );
+
+        // On, but with no icon to show for it: amber, never green.
+        let mut app = LauncherApp::new(path.clone(), Registry::detached(), Tray::detached());
+        app.config.tray = true;
+        let framed = run_frames(&ctx, &mut app, 3);
+        assert_eq!(
+            painted_with(&framed, theme::LIVE).circles,
+            0,
+            "nothing runs in the background without an icon, so nothing may be green"
+        );
+        assert_eq!(
+            painted_with(&framed, theme::ALERT).circles,
+            1,
+            "the header has to say that tray mode is on but has nowhere to go"
+        );
+
+        // With the icon really up: a lit lamp, and nothing is wrong.
+        let mut app = LauncherApp::new(path, Registry::detached(), Tray::pretending());
+        app.config.tray = true;
+        let framed = run_frames(&ctx, &mut app, 3);
+        assert_eq!(
+            painted_with(&framed, theme::LIVE).circles,
+            1,
+            "the lit lamp in the header is the one green circle while nothing is running"
+        );
+        assert_eq!(
+            painted_with(&framed, theme::ALERT).circles,
+            0,
+            "a tray that has its icon must not be reported as a problem"
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

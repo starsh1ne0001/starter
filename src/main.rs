@@ -7,12 +7,19 @@
 
 mod app;
 mod config;
+mod console;
 mod fonts;
 mod hotkey;
 mod processes;
 mod theme;
+mod tray;
 
 fn main() -> eframe::Result<()> {
+    // First thing, before a window exists: the console Windows may have opened
+    // for this program is given back, so that a launcher started from a file
+    // manager does not leave a black window standing behind its own.
+    console::release_ours();
+
     let config_path = config::config_path_from_args();
 
     let options = eframe::NativeOptions {
@@ -29,9 +36,12 @@ fn main() -> eframe::Result<()> {
         Box::new(move |cc| {
             theme::apply(&cc.egui_ctx);
             // Built here, on the thread that runs the event loop, because that
-            // is where the operating system expects hotkeys to be reserved.
+            // is where the operating system expects hotkeys to be reserved — and
+            // where the icon of the notification area has to be put up for its
+            // clicks to reach this program.
             let hotkeys = hotkey::Registry::global(&cc.egui_ctx);
-            Ok(Box::new(app::LauncherApp::new(config_path, hotkeys)))
+            let tray = tray::Tray::install();
+            Ok(Box::new(app::LauncherApp::new(config_path, hotkeys, tray)))
         }),
     )
 }

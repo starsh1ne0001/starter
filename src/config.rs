@@ -15,6 +15,13 @@ pub const DEFAULT_FILE_NAME: &str = "launcher.toml";
 pub struct Config {
     #[serde(default)]
     pub groups: Vec<Group>,
+    /// Keep running in the notification area instead of quitting when the window
+    /// is closed. Written as `tray = true`.
+    ///
+    /// Only does something where the launcher can really put an icon up: the
+    /// window is never hidden without a way back to it.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub tray: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -60,6 +67,12 @@ pub struct Program {
     /// else gets to shut down first. Zero means "at once".
     #[serde(default, skip_serializing_if = "is_zero")]
     pub stop_delay: f32,
+}
+
+/// `skip_serializing_if` for the tray switch: a switched-off mode is not worth
+/// a line in the file.
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 /// `skip_serializing_if` for the delays: a wait of nothing is not written.
@@ -139,6 +152,9 @@ impl Config {
                     programs: vec![program("Chrome", "chrome.exe")],
                 },
             ],
+            // Tray mode is off to begin with: quitting when the window is closed
+            // is what a program does, and the icon is a choice.
+            ..Self::default()
         }
     }
 }
@@ -217,11 +233,13 @@ mod tests {
                     stop_delay: 1.0,
                 }],
             }],
+            tray: true,
         };
 
         let text = toml::to_string_pretty(&config).expect("serializing failed");
         let parsed: Config = toml::from_str(&text).expect("serialized config does not parse");
         assert_eq!(parsed.groups[0].hotkey, "Ctrl+Alt+T");
+        assert!(parsed.tray, "the tray switch did not survive the round trip");
         let program = &parsed.groups[0].programs[0];
         assert_eq!(program.name, "Tool");
         assert_eq!(program.program, "tool.exe");
@@ -274,6 +292,7 @@ mod tests {
                 ],
                 ..Group::default()
             }],
+            ..Config::default()
         };
 
         let text = toml::to_string_pretty(&config).expect("serializing failed");
@@ -339,6 +358,40 @@ mod tests {
         assert_eq!(program.process_name(), "tool.exe");
     }
 
+    /// Tray mode is a switch the file carries — and one that is off says
+    /// nothing, so it is not written.
+    #[test]
+    fn tray_mode_is_written_only_while_it_is_on() {
+        let off = Config {
+            groups: vec![Group {
+                name: "Quiet".to_string(),
+                ..Group::default()
+            }],
+            tray: false,
+        };
+
+        let text = toml::to_string_pretty(&off).expect("serializing failed");
+        assert!(
+            !text.contains("tray"),
+            "a switched-off mode was written to the file:\n{text}"
+        );
+
+        let on = Config {
+            tray: true,
+            ..off
+        };
+        let text = toml::to_string_pretty(&on).expect("serializing failed");
+        assert!(text.contains("tray = true"), "the switch was not written:\n{text}");
+
+        let again: Config = toml::from_str(&text).expect("what we wrote does not parse");
+        assert!(again.tray, "the switch was lost on the way back in");
+
+        // And a file written before tray mode existed is simply off.
+        let older: Config = toml::from_str("[[groups]]\nname = \"Old\"\n")
+            .expect("a file without the switch does not parse");
+        assert!(!older.tray, "the switch has to default to off");
+    }
+
     /// A program identified by its name alone must not grow an empty `match`
     /// line — an empty filter says nothing.
     #[test]
@@ -353,6 +406,7 @@ mod tests {
                 }],
                 ..Group::default()
             }],
+            ..Config::default()
         };
 
         let text = toml::to_string_pretty(&config).expect("serializing failed");
@@ -375,6 +429,7 @@ mod tests {
                     ..Group::default()
                 },
             ],
+            ..Config::default()
         };
 
         let text = toml::to_string_pretty(&config).expect("serializing failed");

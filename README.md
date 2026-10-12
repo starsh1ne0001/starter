@@ -6,7 +6,10 @@ A small, deliberately boring program launcher: pick a group, press **Start** or
 Written in Rust with [egui](https://github.com/emilk/egui) for the window,
 [sysinfo](https://github.com/GuillaumeGomez/sysinfo) for the process handling and
 [global-hotkey](https://github.com/tauri-apps/global-hotkey) for the key
-combinations.
+combinations and [tray-icon](https://github.com/tauri-apps/tray-icon) for the
+icon in the notification area — plus, on Windows,
+[windows-sys](https://github.com/microsoft/windows-rs) for the console window
+behind the launcher (see [below](#the-console-window-behind-the-launcher)).
 
 ## What it does
 
@@ -27,6 +30,10 @@ combinations.
   with, and shares that name with its own helper processes. An optional `match`
   on the command line pins down which processes really belong to the entry —
   for the display and for Stop alike.
+* **Can keep running in the notification area.** Switch **Tray** on in the
+  header and closing the window only takes it off the screen: the launcher stays
+  up, the hotkeys keep working, and the icon is the way back (see
+  [Tray mode](#tray-mode)).
 * Shows whether each program is currently running (refreshed once per second,
   see [below](#cost-of-watching-what-is-running)).
 * Edits its own config file: add/remove groups and programs, then press **Save**.
@@ -75,6 +82,8 @@ Plain TOML, readable and editable by hand. The GUI writes the same format.
 exactly as written, so spaces in it need no quoting and no escaping.
 
 ```toml
+tray = true               # optional: keep running in the notification area
+
 [[groups]]
 name = "Everyday"
 hotkey = "Ctrl+Alt+E"     # optional: toggles this group from anywhere
@@ -211,6 +220,65 @@ thing.
   system refuses, or a system that has no global hotkeys at all — each is
   reported in the status line at the bottom.
 
+## Tray mode
+
+With the **Tray** switch in the header on — `tray = true` in the config file —
+the launcher lives in the notification area, and closing its window no longer
+ends it:
+
+* **Closing only takes the window off the screen.** The program keeps running,
+  so the hotkeys keep toggling their groups, waiting delays still come due, and
+  the status stays as honest as it was; it is simply not on screen. Nothing about
+  the window's own state is touched while it is hidden, so it comes back exactly
+  as it was left.
+* **The icon is the way back.** A click on it brings the window up and to the
+  front. Its menu — the right button, or a long press where that is the
+  convention — lists every group by name together with its hotkey and offers
+  *Show window* and *Quit*, so a group can be toggled without opening anything.
+* **Quit is the only thing that ends the program.** Closing the window never
+  does while tray mode is on, and the *Quit* line is not answered by hiding —
+  otherwise a program in tray mode could not be ended from its own icon.
+* **Hotkeys keep working while the window is hidden**, which is the point of the
+  whole thing. The process list is re-read at the slower background cadence and
+  a hotkey still re-reads it on the spot before deciding, so the key never acts
+  on a stale picture.
+* **Without an icon, nothing is hidden.** Where the launcher cannot put an icon
+  up, it does not take the window away either: hiding a window with no way back
+  to it would be a trap. The close button then keeps doing what it always did,
+  and the reason is reported in the status line.
+* **The header says which of the three states it is in**, in colour, because
+  what the close button does is worth knowing at a glance: the lamp beside
+  **Tray** is lit green while there really is an icon in the notification area,
+  amber while tray mode is on but there is nowhere to put one, and a hollow ring
+  while the mode is off. Only the green one means the launcher will outlive its
+  window, and the whole switch is washed in that same colour while it is on.
+
+Turning the switch on writes a line into the config like any other setting, and
+switching it off takes the icon away again and answers the close button the old
+way. The icon itself is the launcher's own status lamp, drawn in code instead of
+shipped as an image file, so it cannot drift away from the window's palette.
+
+Tray mode is wired up **for Windows only.** The other platforms each want an
+arrangement of their own — Linux a GTK main loop, macOS a template image for the
+menu bar — and none of that is in here, so there the switch reports that it
+cannot put an icon up and the window goes on closing the way any window does.
+
+### The console window behind the launcher
+
+A debug build is a console program, so that `cargo run` shows whatever it has to
+say. Started from a file manager, an editor or a shortcut instead of from a
+terminal, Windows then gives it a console off its own — a black window on the
+desktop. That hardly mattered while the launcher ended together with its window;
+in tray mode the program outlives its window, and the black window is left
+standing with nothing behind it. It is therefore given back at startup: see
+[src/console.rs](src/console.rs).
+
+Only a console the launcher has **to itself** is given back. One shared with a
+shell is left alone, because that is where its own output goes — the notes the
+hotkeys write at startup and the message a panic writes. A terminal, `cargo run`
+and a script handing its console down are all recognised and left untouched; a
+release build has no console to give back in the first place.
+
 ## The look
 
 A launcher is a control panel, so the visual language is borrowed from hardware:
@@ -219,10 +287,12 @@ lights up when something is running.
 
 Three rules hold it together:
 
-1. **Colour only ever means state.** There is no brand accent. Green is running,
-grey is stopped, amber means you have unsaved changes. A program waiting for its
-start or stop delay gets no colour of its own — it says `starting in 2 s`, so
-that green keeps meaning exactly one thing.
+1. **Colour only ever means state.** There is no brand accent. Green is running —
+and, in the header, that the launcher really has an icon in the notification
+area; grey is stopped; amber is something asked for that is not happening, which
+is an unsaved change and, next to **Tray**, a tray mode with nowhere to put its
+icon. A program waiting for its start or stop delay gets no colour of its own —
+it says `starting in 2 s`, so that green keeps meaning exactly one thing.
 2. **Structure comes from hairlines and alignment, not from boxes.** No card
 around each program, no border around every group of things.
 3. **Two kinds of type for two kinds of content.** Prose and names are set in
@@ -261,6 +331,8 @@ quietly become something else.
 | [src/config.rs](src/config.rs) | TOML config model, load/save |
 | [src/processes.rs](src/processes.rs) | Start, find and stop processes |
 | [src/hotkey.rs](src/hotkey.rs) | Key combinations, OS registration, press handling |
+| [src/tray.rs](src/tray.rs) | The notification-area icon, its menu, and the icon image |
+| [src/console.rs](src/console.rs) | Giving back the console window Windows opened for us |
 | [src/fonts.rs](src/fonts.rs) | Finding the system's own typefaces |
 | [src/theme.rs](src/theme.rs) | Palette, type scale, egui visuals |
 | [src/app.rs](src/app.rs) | The GUI |
@@ -302,7 +374,8 @@ refresh that the launcher used to do for every entry.
 
 A start or stop delay does not add a tick either: while one is waiting, the next
 frame is scheduled for the moment it is due. Nothing spins in between, and a
-delay still lands while the window is in the background.
+delay still lands while the window is in the background — or hidden, in
+[tray mode](#tray-mode).
 
 ## Tests
 
@@ -364,6 +437,26 @@ Beyond parsing, the suite covers the parts that are easy to break silently:
 * **Colour tracks state.** With nothing running, not a single green shape may be
   painted; with a program marked running, exactly the lamp, the rail, the group
   lamp and the group summary dot must be.
+* **Tray mode shows itself in colour, and only truthfully.** The header is drawn
+  in each of its three states: amber and no green while tray mode is on without
+  an icon, and exactly one green lamp — the lit one in the header — while the
+  icon is really up.
+* **Closing the window hides it while tray mode is on.** A frame is drawn with
+  the close button pressed: it has to ask for the close to be called off and for
+  the window to disappear, and the launcher has to stay alive. Without an icon
+  the same frame must ask for neither — a window that hides itself with no way
+  back would be a trap.
+* **The head keeps working with the window hidden.** Only that half of a frame
+  runs while the window is off the screen, so a hotkey is fed in and nothing but
+  the head is drawn: its group has to be toggled anyway.
+* **The icon does what it promises.** A click on it asks for the window back and
+  to the front, a line of its menu toggles the group it names, and *Quit* is not
+  answered by hiding the window.
+* **Tray mode is a config value like any other** — written, saved, read back,
+  and left out of the file while it is off.
+* **Only a console of the launcher's own is given back.** The rule behind it is
+  checked directly: no console at all, a console with one process on it, and a
+  console shared with a shell each fall on the side they have to.
 
 Four checks ask the machine instead of a mock and are marked `#[ignore]`, so they
 only run when asked:

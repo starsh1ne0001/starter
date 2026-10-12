@@ -292,6 +292,17 @@ fn sender() -> Option<&'static Sender<u32>> {
 // The registry
 // ---------------------------------------------------------------------------
 
+/// A mailbox for one detached registry, which is what the tests use.
+///
+/// Kept out of [`Registry::detached`] itself because that one is also built
+/// into a program without tests, where there is no such field to fill: this way
+/// the channel and the field appear and disappear together.
+#[cfg(test)]
+fn own_mailbox() -> Option<(Sender<u32>, Mutex<Receiver<u32>>)> {
+    let (sender, receiver) = channel();
+    Some((sender, Mutex::new(receiver)))
+}
+
 /// Hands the configured chords to the operating system and keeps track of them.
 pub struct Registry {
     /// `None` when nothing is reserved with the OS. Either because this is a
@@ -305,6 +316,15 @@ pub struct Registry {
     owner: HashMap<u32, usize>,
     /// Group index -> why the chord is *not* live, for the ones that failed.
     refusals: HashMap<usize, String>,
+    /// A mailbox of this registry's own, for detached ones in tests.
+    ///
+    /// A running program has one mailbox and one registry, so real presses go
+    /// through [`mailbox`]. Tests are several registries at once in one process,
+    /// and the one they share would let a test that happens to be looking at
+    /// that moment swallow another test's press. [`Registry::inbox`] is the one
+    /// place that decides which mailbox is meant.
+    #[cfg(test)]
+    own: Option<(Sender<u32>, Mutex<Receiver<u32>>)>,
 }
 
 impl Registry {
@@ -313,6 +333,12 @@ impl Registry {
     /// reason is kept for the user.
     pub fn global(ctx: &egui::Context) -> Self {
         let mut registry = Self::detached();
+        // Real presses arrive on the program's mailbox, so a registry that is
+        // wired to the operating system never reads one of its own.
+        #[cfg(test)]
+        {
+            registry.own = None;
+        }
 
         match GlobalHotKeyManager::new() {
             Ok(manager) => {
@@ -347,6 +373,8 @@ impl Registry {
             registered: HashMap::new(),
             owner: HashMap::new(),
             refusals: HashMap::new(),
+            #[cfg(test)]
+            own: own_mailbox(),
         }
     }
 
@@ -438,10 +466,19 @@ impl Registry {
             .map_err(|err| format!("{chord} could not be reserved ({err})"))
     }
 
+    /// The mailbox this registry reads from: its own when it is detached (in
+    /// tests), the program's one otherwise.
+    fn inbox(&self) -> &Mutex<Receiver<u32>> {
+        #[cfg(test)]
+        if let Some((_, own)) = &self.own {
+            return own;
+        }
+        mailbox()
+    }
+
     /// Group indices whose hotkey was pressed since the last call.
     pub fn presses(&mut self) -> Vec<usize> {
-        let mailbox = mailbox();
-        let Ok(receiver) = mailbox.try_lock() else {
+        let Ok(receiver) = self.inbox().try_lock() else {
             return Vec::new();
         };
         let ids: Vec<u32> = receiver.try_iter().collect();
@@ -454,7 +491,14 @@ impl Registry {
     /// the tests reach the state logic without touching a keyboard.
     #[cfg(test)]
     pub fn trigger(&self, chord: Chord) {
-        if let (Some(sender), Some(id)) = (sender(), hotkey_id(chord)) {
+        let Some(id) = hotkey_id(chord) else {
+            return;
+        };
+        if let Some((own, _)) = &self.own {
+            let _ = own.send(id);
+            return;
+        }
+        if let Some(sender) = sender() {
             let _ = sender.send(id);
         }
     }
